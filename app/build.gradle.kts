@@ -33,11 +33,19 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    packaging {
+        jniLibs {
+            excludes += setOf("**/libandroidx.graphics.path.so")
+        }
+    }
 }
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.google.android.material:material:1.12.0")
+    implementation("com.google.android.material:material:1.12.0") {
+        exclude(group = "androidx.graphics", module = "graphics-path")
+    }
     implementation("androidx.documentfile:documentfile:1.0.1")
 }
