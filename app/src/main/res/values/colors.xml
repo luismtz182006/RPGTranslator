@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="navy_dark">#0F172A</color>
+    <color name="navy_surface">#1E293B</color>
+    <color name="teal_accent">#2DD4BF</color>
+    <color name="teal_accent_dark">#0D9488</color>
+    <color name="text_light">#F1F5F9</color>
+    <color name="text_muted">#94A3B8</color>
+</resources>
