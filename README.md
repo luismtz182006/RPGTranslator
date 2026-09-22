@@ -32,9 +32,10 @@ volumen, hay reintentos automáticos con espera.
 4. Ajusta idioma origen/destino (`auto`/`ja`/`en`... → `es`/`en`...).
 5. Toca **Traducir** y espera — la barra de progreso muestra archivo y línea/
    campo actual.
-6. **Importante:** esta app solo traduce el *texto*. Copia tú, sin traducir,
-   las carpetas de imágenes, audio, `js/`, `Save/`, etc. dentro de la misma
-   carpeta de salida para tener el proyecto completo y jugable.
+6. **Importante:** esta app solo traduce el *texto*, nada más — no copia
+   imágenes, audio, `js/`, `Save/`, etc. Copia tú esas carpetas aparte, sin
+   traducir, dentro de la misma carpeta de salida para tener el proyecto
+   completo y jugable.
 
 ## Limitaciones honestas (v1)
 
