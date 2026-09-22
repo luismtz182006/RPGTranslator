@@ -127,33 +127,56 @@ class MainActivity : AppCompatActivity() {
             log("✘ No se encontró una carpeta 'data' (ni 'www/data') dentro del proyecto elegido.")
             return
         }
-        val outDataDir = outputRoot.findFile("data")?.takeIf { it.isDirectory }
-            ?: outputRoot.createDirectory("data")
-            ?: run { log("✘ No se pudo crear la carpeta de salida"); return }
 
-        log("Procesando archivos de datos de RPG Maker…\n")
-        val (ok, fail) = translator.translateProject(dataDir, outDataDir) { p ->
-            runOnUiThread {
-                tvProgressLabel.text = "[${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — ${p.unitIndex}/${p.unitTotal}"
-                progressBar.max = p.fileTotal
-                progressBar.progress = p.fileIndex
-            }
+        log("Copiando el proyecto completo (imágenes, audio, js, etc.)…")
+        var copiedFiles = 0
+        FileCopier.copyRecursively(contentResolver, projectRoot, outputRoot) {
+            copiedFiles++
+            if (copiedFiles % 25 == 0) runOnUiThread { tvProgressLabel.text = "Copiando… $copiedFiles archivos" }
         }
-        log("\nListo: $ok archivo(s) traducido(s), $fail con error.")
-        log("Copia también, sin traducir, las carpetas img/, audio/, js/ y demás dentro de la misma carpeta de salida para tener el proyecto completo.")
+        log("Copia completa: $copiedFiles archivo(s).\n")
+
+        val outDataDir = outputRoot.findFile("data")?.takeIf { it.isDirectory }
+            ?: outputRoot.findFile("www")?.findFile("data")?.takeIf { it.isDirectory }
+            ?: outputRoot.createDirectory("data")
+            ?: run { log("✘ No se pudo preparar la carpeta de salida"); return }
+
+        log("Traduciendo archivos de datos (varios en paralelo)…\n")
+        val (ok, fail) = translator.translateProject(
+            dataDir, outDataDir,
+            onProgress = { p ->
+                runOnUiThread {
+                    tvProgressLabel.text = "[archivo ${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — ${p.unitIndex}/${p.unitTotal}"
+                    progressBar.max = p.fileTotal
+                    progressBar.progress = p.fileIndex
+                }
+            },
+            onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
+        )
+        log("\nListo: $ok archivo(s) traducido(s), $fail con error de archivo completo.")
+        log("La carpeta de salida ya tiene el proyecto completo (imágenes, audio, js incluidos).")
     }
 
     private fun runRenpy(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TranslationClient) {
         val translator = RenpyTranslator(contentResolver, client)
-        log("Procesando archivos .rpy…\n")
-        val (ok, fail) = translator.translateProject(projectRoot, outputRoot) { p ->
-            runOnUiThread {
-                tvProgressLabel.text = "[${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — línea ${p.lineIndex}/${p.lineTotal}"
-                progressBar.max = p.fileTotal
-                progressBar.progress = p.fileIndex
-            }
-        }
-        log("\nListo: $ok archivo(s) .rpy traducido(s), $fail con error.")
-        log("Copia también, sin traducir, las imágenes/audio del juego a la misma carpeta de salida.")
+        log("Copiando el proyecto y traduciendo los .rpy (varios en paralelo)…\n")
+        var copiedFiles = 0
+        val (ok, fail) = translator.translateProject(
+            projectRoot, outputRoot,
+            onCopyProgress = {
+                copiedFiles++
+                if (copiedFiles % 25 == 0) runOnUiThread { tvProgressLabel.text = "Copiando… $copiedFiles archivos" }
+            },
+            onProgress = { p ->
+                runOnUiThread {
+                    tvProgressLabel.text = "[archivo ${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — línea ${p.lineIndex}/${p.lineTotal}"
+                    progressBar.max = p.fileTotal
+                    progressBar.progress = p.fileIndex
+                }
+            },
+            onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
+        )
+        log("\nListo: $ok archivo(s) .rpy traducido(s), $fail con error de archivo completo.")
+        log("La carpeta de salida ya tiene el proyecto completo (imágenes, audio incluidos).")
     }
 }
