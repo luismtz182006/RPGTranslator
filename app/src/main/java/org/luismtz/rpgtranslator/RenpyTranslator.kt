@@ -7,13 +7,14 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Traduce los archivos .rpy de un proyecto Ren'Py trabajando línea por línea,
- * y copia todo lo demás (imágenes, audio, rpyc, etc.) tal cual para que la
- * salida sea un proyecto completo y jugable.
+ * Traduce los archivos .rpy de un proyecto Ren'Py trabajando línea por línea.
+ * Solo procesa texto: NO copia imágenes, audio ni ningún otro asset — la
+ * carpeta de salida solo contendrá los .rpy traducidos, replicando la
+ * estructura de subcarpetas donde estaban.
  *
- * Procesa varios archivos .rpy EN PARALELO. Si una línea puntual falla al
- * traducir, se deja tal cual (no se traduce esa línea) en vez de perder el
- * resto del archivo.
+ * Procesa varios archivos .rpy EN PARALELO para que sea rápido. Si una línea
+ * puntual falla al traducir, se deja tal cual en vez de perder el resto del
+ * archivo.
  */
 class RenpyTranslator(
     private val resolver: ContentResolver,
@@ -26,27 +27,20 @@ class RenpyTranslator(
     private val dialogueRegex = Regex("""^(\s*)([A-Za-z_][A-Za-z0-9_.]*\s+)?"((?:[^"\\]|\\.)*)"(\s*)$""")
     private val choiceRegex = Regex("""^(\s*)"((?:[^"\\]|\\.)*)"(\s*):(\s*)$""")
 
-    /**
-     * Copia primero TODO el proyecto tal cual (imágenes, audio, etc.), y
-     * luego traduce y sobreescribe únicamente los .rpy en la carpeta de salida.
-     */
     fun translateProject(
         sourceDir: DocumentFile,
         outputDir: DocumentFile,
-        onCopyProgress: (String) -> Unit = {},
         onProgress: (Progress) -> Unit,
         onWarning: (Warning) -> Unit = {}
     ): Pair<Int, Int> {
-        // 1. Copia completa del proyecto (todo, incluyendo los .rpy sin traducir todavía)
-        FileCopier.copyRecursively(resolver, sourceDir, outputDir, onFile = onCopyProgress)
-
-        // 2. Localiza los .rpy ya copiados en la salida y los traduce ahí mismo, en paralelo
         val rpyFiles = ArrayList<DocumentFile>()
-        collectRpyFiles(outputDir, rpyFiles)
+        collectRpyFiles(sourceDir, rpyFiles)
 
         val ok = AtomicInteger(0)
         val fail = AtomicInteger(0)
         val fileIndexCounter = AtomicInteger(0)
+        val dirCache = HashMap<String, DocumentFile>()
+        dirCache[""] = outputDir
 
         val pool = Executors.newFixedThreadPool(parallelism)
         try {
@@ -55,7 +49,8 @@ class RenpyTranslator(
                     val name = file.name ?: "?"
                     try {
                         val fileIdx = fileIndexCounter.getAndIncrement()
-                        translateSingleFileInPlace(file) { lineIdx, lineTotal ->
+                        val outDir = synchronized(dirCache) { resolveOutputDir(file, sourceDir, outputDir, dirCache) }
+                        translateSingleFile(file, outDir, { detail -> onWarning(Warning(name, detail)) }) { lineIdx, lineTotal ->
                             onProgress(Progress(fileIdx, rpyFiles.size, name, lineIdx, lineTotal))
                         }
                         ok.incrementAndGet()
@@ -84,21 +79,54 @@ class RenpyTranslator(
         }
     }
 
-    /** Traduce un .rpy ya copiado en destino, reemplazando su propio contenido en el mismo lugar. */
-    private fun translateSingleFileInPlace(file: DocumentFile, onLineProgress: (Int, Int) -> Unit) {
+    /** Encuentra (creando si hace falta) la carpeta de salida que replica la ruta relativa del .rpy. Cachea resultados. */
+    private fun resolveOutputDir(
+        file: DocumentFile, sourceRoot: DocumentFile, outputRoot: DocumentFile,
+        cache: MutableMap<String, DocumentFile>
+    ): DocumentFile {
+        val relPath = relativePath(file.parentFile, sourceRoot)
+        val key = relPath.joinToString("/")
+        cache[key]?.let { return it }
+
+        var current = outputRoot
+        var accumKey = ""
+        for (seg in relPath) {
+            accumKey = if (accumKey.isEmpty()) seg else "$accumKey/$seg"
+            current = cache[accumKey] ?: run {
+                val existing = current.findFile(seg)
+                val d = if (existing != null && existing.isDirectory) existing else current.createDirectory(seg)!!
+                cache[accumKey] = d
+                d
+            }
+        }
+        cache[key] = current
+        return current
+    }
+
+    private fun relativePath(dir: DocumentFile?, root: DocumentFile): List<String> {
+        val segments = ArrayList<String>()
+        var current = dir
+        while (current != null && current.uri != root.uri) {
+            segments.add(0, current.name ?: "")
+            current = current.parentFile
+        }
+        return segments
+    }
+
+    private fun translateSingleFile(
+        file: DocumentFile, outDir: DocumentFile,
+        onWarning: (String) -> Unit, onLineProgress: (Int, Int) -> Unit
+    ) {
         val lines = resolver.openInputStream(file.uri)?.bufferedReader(Charsets.UTF_8)?.readLines()
             ?: throw IllegalStateException("no se pudo leer ${file.name}")
 
-        val warnings = StringBuilder()
         val outLines = ArrayList<String>(lines.size)
         for ((i, line) in lines.withIndex()) {
-            outLines.add(translateLine(line) { warnings.append(it).append('\n') })
+            outLines.add(translateLine(line, onWarning))
             onLineProgress(i + 1, lines.size)
         }
 
-        resolver.openOutputStream(file.uri, "wt")?.use { os ->
-            os.write(outLines.joinToString("\n").toByteArray(Charsets.UTF_8))
-        } ?: throw IllegalStateException("no se pudo escribir ${file.name}")
+        FileCopier.writeTextFile(resolver, outDir, file.name ?: "script.rpy", "text/plain", outLines.joinToString("\n"))
     }
 
     private fun translateLine(line: String, onWarning: (String) -> Unit): String {
