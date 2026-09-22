@@ -128,20 +128,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        log("Copiando el proyecto completo (imágenes, audio, js, etc.)…")
-        var copiedFiles = 0
-        FileCopier.copyRecursively(contentResolver, projectRoot, outputRoot) {
-            copiedFiles++
-            if (copiedFiles % 25 == 0) runOnUiThread { tvProgressLabel.text = "Copiando… $copiedFiles archivos" }
-        }
-        log("Copia completa: $copiedFiles archivo(s).\n")
-
+        log("Traduciendo archivos de datos (varios en paralelo)…\n")
         val outDataDir = outputRoot.findFile("data")?.takeIf { it.isDirectory }
-            ?: outputRoot.findFile("www")?.findFile("data")?.takeIf { it.isDirectory }
             ?: outputRoot.createDirectory("data")
             ?: run { log("✘ No se pudo preparar la carpeta de salida"); return }
 
-        log("Traduciendo archivos de datos (varios en paralelo)…\n")
         val (ok, fail) = translator.translateProject(
             dataDir, outDataDir,
             onProgress = { p ->
@@ -154,19 +145,14 @@ class MainActivity : AppCompatActivity() {
             onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
         )
         log("\nListo: $ok archivo(s) traducido(s), $fail con error de archivo completo.")
-        log("La carpeta de salida ya tiene el proyecto completo (imágenes, audio, js incluidos).")
+        log("Solo se tradujo el texto — copia tú las carpetas de imágenes/audio/js si las necesitas en la salida.")
     }
 
     private fun runRenpy(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TranslationClient) {
         val translator = RenpyTranslator(contentResolver, client)
-        log("Copiando el proyecto y traduciendo los .rpy (varios en paralelo)…\n")
-        var copiedFiles = 0
+        log("Traduciendo archivos .rpy (varios en paralelo)…\n")
         val (ok, fail) = translator.translateProject(
             projectRoot, outputRoot,
-            onCopyProgress = {
-                copiedFiles++
-                if (copiedFiles % 25 == 0) runOnUiThread { tvProgressLabel.text = "Copiando… $copiedFiles archivos" }
-            },
             onProgress = { p ->
                 runOnUiThread {
                     tvProgressLabel.text = "[archivo ${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — línea ${p.lineIndex}/${p.lineTotal}"
@@ -177,6 +163,6 @@ class MainActivity : AppCompatActivity() {
             onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
         )
         log("\nListo: $ok archivo(s) .rpy traducido(s), $fail con error de archivo completo.")
-        log("La carpeta de salida ya tiene el proyecto completo (imágenes, audio incluidos).")
+        log("Solo se tradujo el texto — copia tú las imágenes/audio si las necesitas en la salida.")
     }
 }
