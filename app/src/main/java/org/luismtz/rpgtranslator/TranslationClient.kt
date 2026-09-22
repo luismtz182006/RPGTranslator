@@ -73,7 +73,7 @@ class TranslationClient(
          * reemplazándolos por marcadores @@N@@ antes de traducir, para que el traductor
          * automático no los altere. Devuelve el texto con marcadores y el mapa para restaurarlos.
          */
-        private val controlCodeRegex = Regex("""\\([A-Za-z]+(\[[^\]]*])?|.)""")
+        private val controlCodeRegex = Regex("""\\([A-Za-z]+(\[[^\]]*\])?|.)""")
 
         fun protectControlCodes(text: String): Pair<String, List<String>> {
             val codes = ArrayList<String>()
@@ -94,7 +94,7 @@ class TranslationClient(
         }
 
         /** Protege interpolaciones de Ren'Py: [variable], {tag}, {/tag} */
-        private val renpyTagRegex = Regex("""\[[^\[\]]*]|\{[^{}]*}""")
+        private val renpyTagRegex = Regex("""\[[^\[\]]*\]|\{[^{}]*\}""")
 
         fun protectRenpyTags(text: String): Pair<String, List<String>> {
             val tags = ArrayList<String>()
