@@ -6,36 +6,68 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Cliente de traducción automática. Usa el endpoint público (no oficial) de
  * Google Translate — el mismo que usan la mayoría de las herramientas hobby
  * de este tipo (no requiere API key). Pensado para uso personal moderado;
  * si Google empieza a bloquear por volumen, hay un backoff con reintentos.
+ *
+ * Cachea cada traducción exacta (mismo texto + mismo par de idiomas): en
+ * proyectos de juego es normal repetir frases cientos de veces ("Sí", "No",
+ * nombres de objetos, HP/MP, etc.), así que reutilizar el resultado ahorra
+ * llamadas de red — más rápido y con menos oportunidades de que algo falle.
+ * La caché se comparte entre todos los hilos que usan la misma instancia.
  */
 class TranslationClient(
     private val sourceLang: String = "auto",
-    private val targetLang: String = "es"
+    private val targetLang: String = "es",
+    initialCache: Map<String, String> = emptyMap()
 ) {
     class TranslationException(msg: String, cause: Throwable? = null) : Exception(msg, cause)
+
+    private val cache = ConcurrentHashMap<String, String>(initialCache)
+
+    @Volatile
+    private var cancelled = false
+
+    /** Pide detener cuanto antes: las próximas llamadas a translate() fallan de inmediato (sin red). */
+    fun cancel() { cancelled = true }
+
+    /** Copia actual de la caché en memoria, para guardarla y reutilizarla en la siguiente corrida. */
+    fun exportCache(): Map<String, String> = cache.toMap()
 
     /** Traduce un texto simple. Vacío o solo-espacios se devuelve tal cual (no gasta llamada). */
     fun translate(text: String): String {
         if (text.isBlank()) return text
+        if (cancelled) throw TranslationException("cancelado por el usuario")
+
+        cache[text]?.let { return it }
 
         var attempt = 0
         var lastError: Exception? = null
-        while (attempt < 3) {
+        while (attempt < 4) {
+            if (cancelled) throw TranslationException("cancelado por el usuario")
             try {
-                return doRequest(text)
+                val result = doRequest(text)
+                cache[text] = result
+                return result
+            } catch (e: RateLimitException) {
+                lastError = e
+                attempt++
+                // Google está limitando por volumen: esperamos bastante más que un error normal.
+                Thread.sleep(1500L * attempt + (0..300).random())
             } catch (e: Exception) {
                 lastError = e
                 attempt++
-                Thread.sleep(600L * attempt) // backoff simple
+                Thread.sleep(400L * attempt + (0..200).random()) // backoff con jitter
             }
         }
-        throw TranslationException("Fallo al traducir tras 3 intentos: ${lastError?.message}", lastError)
+        throw TranslationException("Fallo al traducir tras 4 intentos: ${lastError?.message}", lastError)
     }
+
+    private class RateLimitException(msg: String) : Exception(msg)
 
     private fun doRequest(text: String): String {
         val encoded = URLEncoder.encode(text, "UTF-8")
@@ -48,6 +80,10 @@ class TranslationClient(
         conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android)")
 
         val code = conn.responseCode
+        if (code == 429 || code == 503) {
+            conn.disconnect()
+            throw RateLimitException("HTTP $code (límite de volumen)")
+        }
         if (code != 200) {
             conn.disconnect()
             throw TranslationException("HTTP $code")
