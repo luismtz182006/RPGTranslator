@@ -48,4 +48,6 @@ dependencies {
         exclude(group = "androidx.graphics", module = "graphics-path")
     }
     implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("com.google.mlkit:translate:17.0.3")
+    implementation("com.google.android.gms:play-services-tasks:18.2.0")
 }
