@@ -209,6 +209,28 @@
                             android:textColor="@color/text_light" />
                     </com.google.android.material.textfield.TextInputLayout>
                 </LinearLayout>
+
+                <RadioGroup
+                    android:id="@+id/rgMode"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp">
+
+                    <RadioButton
+                        android:id="@+id/rbOnline"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:checked="true"
+                        android:textColor="@color/text_light"
+                        android:text="En línea (necesita internet, soporta 'auto')" />
+
+                    <RadioButton
+                        android:id="@+id/rbOffline"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/text_light"
+                        android:text="Local / sin internet (descarga el modelo una vez)" />
+                </RadioGroup>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
