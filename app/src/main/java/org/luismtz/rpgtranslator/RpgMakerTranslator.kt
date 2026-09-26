@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class RpgMakerTranslator(
     private val resolver: ContentResolver,
-    private val client: TranslationClient,
+    private val client: TextTranslator,
     private val parallelism: Int = 6
 ) {
     data class Progress(val fileIndex: Int, val fileTotal: Int, val fileName: String, val unitIndex: Int, val unitTotal: Int)
