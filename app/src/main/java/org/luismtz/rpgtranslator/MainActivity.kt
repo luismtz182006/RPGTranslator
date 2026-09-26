@@ -17,7 +17,7 @@ class MainActivity : AppCompatActivity() {
 
     private var projectDirUri: Uri? = null
     private var outputDirUri: Uri? = null
-    private var activeClient: TranslationClient? = null
+    private var activeClient: TextTranslator? = null
 
     private val prefsName = "rpg_translator_prefs"
     private val keyProjectDir = "project_dir_uri"
@@ -30,6 +30,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rgEngine: RadioGroup
     private lateinit var rbRenpy: RadioButton
     private lateinit var rbRpgMaker: RadioButton
+    private lateinit var rgMode: RadioGroup
+    private lateinit var rbOffline: RadioButton
     private lateinit var tvProjectDir: TextView
     private lateinit var tvOutputDir: TextView
     private lateinit var etSourceLang: TextInputEditText
@@ -75,6 +77,8 @@ class MainActivity : AppCompatActivity() {
         rgEngine = findViewById(R.id.rgEngine)
         rbRenpy = findViewById(R.id.rbRenpy)
         rbRpgMaker = findViewById(R.id.rbRpgMaker)
+        rgMode = findViewById(R.id.rgMode)
+        rbOffline = findViewById(R.id.rbOffline)
         tvProjectDir = findViewById(R.id.tvProjectDir)
         tvOutputDir = findViewById(R.id.tvOutputDir)
         etSourceLang = findViewById(R.id.etSourceLang)
@@ -152,16 +156,18 @@ class MainActivity : AppCompatActivity() {
 
         val srcLang = etSourceLang.text?.toString()?.trim().takeUnless { it.isNullOrBlank() } ?: "auto"
         val tgtLang = etTargetLang.text?.toString()?.trim().takeUnless { it.isNullOrBlank() } ?: "es"
+        val offline = rbOffline.isChecked
+
+        if (offline && srcLang.equals("auto", ignoreCase = true)) {
+            Toast.makeText(this, "El modo local no soporta 'auto': escribe el idioma de origen real (ej. 'ja')", Toast.LENGTH_LONG).show()
+            return
+        }
+
         prefs.edit()
             .putString(keySrcLang, srcLang)
             .putString(keyTgtLang, tgtLang)
             .putString(keyEngine, if (rbRenpy.isChecked) "renpy" else "rpgmaker")
             .apply()
-
-        val savedCache = TranslationCacheStore.load(this, srcLang, tgtLang)
-        if (savedCache.isNotEmpty()) log("Reutilizando ${savedCache.size} traducción(es) ya hechas antes.\n")
-        val client = TranslationClient(srcLang, tgtLang, savedCache)
-        activeClient = client
 
         val projectRoot = DocumentFile.fromTreeUri(this, projUri)
         val outputRoot = DocumentFile.fromTreeUri(this, outUri)
@@ -177,16 +183,38 @@ class MainActivity : AppCompatActivity() {
         val startTime = System.currentTimeMillis()
 
         Thread {
+            var offlineClientRef: OfflineTranslationClient? = null
             try {
+                val client: TextTranslator = if (offline) {
+                    log("Preparando traductor local ($srcLang → $tgtLang)…")
+                    val oc = OfflineTranslationClient(srcLang, tgtLang)
+                    offlineClientRef = oc
+                    activeClient = oc
+                    log("Descargando modelo de idioma si hace falta (una sola vez, puede tardar)…")
+                    oc.ensureModelDownloaded()
+                    log("Modelo listo. Traduciendo sin conexión…\n")
+                    oc
+                } else {
+                    val savedCache = TranslationCacheStore.load(this, srcLang, tgtLang)
+                    if (savedCache.isNotEmpty()) log("Reutilizando ${savedCache.size} traducción(es) ya hechas antes.\n")
+                    val tc = TranslationClient(srcLang, tgtLang, savedCache)
+                    activeClient = tc
+                    tc
+                }
+
                 if (rbRenpy.isChecked) {
                     runRenpy(projectRoot, outputRoot, client)
                 } else {
                     runRpgMaker(projectRoot, outputRoot, client)
                 }
+
+                if (!offline) {
+                    TranslationCacheStore.save(this, srcLang, tgtLang, client.exportCache())
+                }
             } catch (e: Exception) {
-                log("✘ Error inesperado: ${e.message}")
+                log("✘ Error: ${e.message}")
             } finally {
-                TranslationCacheStore.save(this, srcLang, tgtLang, client.exportCache())
+                offlineClientRef?.close()
                 val elapsedSec = (System.currentTimeMillis() - startTime) / 1000
                 log("Tiempo total: ${elapsedSec}s.")
                 activeClient = null
@@ -198,7 +226,7 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun runRpgMaker(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TranslationClient) {
+    private fun runRpgMaker(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TextTranslator) {
         val translator = RpgMakerTranslator(contentResolver, client)
         val dataDir = translator.findDataFolder(projectRoot)
         if (dataDir == null) {
@@ -226,7 +254,7 @@ class MainActivity : AppCompatActivity() {
         log("Solo se tradujo el texto — copia tú las carpetas de imágenes/audio/js si las necesitas en la salida.")
     }
 
-    private fun runRenpy(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TranslationClient) {
+    private fun runRenpy(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TextTranslator) {
         val translator = RenpyTranslator(contentResolver, client)
         log("Traduciendo archivos .rpy (varios en paralelo)…\n")
         val (ok, fail) = translator.translateProject(
