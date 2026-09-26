@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class RenpyTranslator(
     private val resolver: ContentResolver,
-    private val client: TranslationClient,
+    private val client: TextTranslator,
     private val parallelism: Int = 6
 ) {
     data class Progress(val fileIndex: Int, val fileTotal: Int, val fileName: String, val lineIndex: Int, val lineTotal: Int)
