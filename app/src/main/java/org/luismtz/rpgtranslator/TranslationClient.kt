@@ -24,7 +24,7 @@ class TranslationClient(
     private val sourceLang: String = "auto",
     private val targetLang: String = "es",
     initialCache: Map<String, String> = emptyMap()
-) {
+) : TextTranslator {
     class TranslationException(msg: String, cause: Throwable? = null) : Exception(msg, cause)
 
     private val cache = ConcurrentHashMap<String, String>(initialCache)
@@ -33,13 +33,13 @@ class TranslationClient(
     private var cancelled = false
 
     /** Pide detener cuanto antes: las próximas llamadas a translate() fallan de inmediato (sin red). */
-    fun cancel() { cancelled = true }
+    override fun cancel() { cancelled = true }
 
     /** Copia actual de la caché en memoria, para guardarla y reutilizarla en la siguiente corrida. */
-    fun exportCache(): Map<String, String> = cache.toMap()
+    override fun exportCache(): Map<String, String> = cache.toMap()
 
     /** Traduce un texto simple. Vacío o solo-espacios se devuelve tal cual (no gasta llamada). */
-    fun translate(text: String): String {
+    override fun translate(text: String): String {
         if (text.isBlank()) return text
         if (cancelled) throw TranslationException("cancelado por el usuario")
 
