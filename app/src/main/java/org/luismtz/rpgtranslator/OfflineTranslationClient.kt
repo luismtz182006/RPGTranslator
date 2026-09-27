@@ -6,19 +6,26 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
- * Traduce completamente en el dispositivo, sin internet, usando ML Kit
- * (los mismos modelos del modo sin conexión de la app Google Translate).
+ * Traduce completamente en el dispositivo, sin internet, usando ML Kit.
  *
  * El modelo del idioma se descarga UNA sola vez (llamar [ensureModelDownloaded]
  * antes de traducir, requiere internet solo esa primera vez); después, cada
  * llamada a [translate] es local.
  *
- * ML Kit no soporta detección automática de idioma de origen ("auto") como
- * el modo en línea — hay que indicar el idioma de origen real.
+ * ML Kit no soporta detección automática de idioma de origen ("auto").
+ *
+ * **Cancelación — best effort:** [cancel] evita que se INICIEN nuevas
+ * traducciones, pero una llamada ya en curso a `Tasks.await(...)` es
+ * bloqueante y corre hasta terminar (hasta 30s de timeout) — no hay forma de
+ * interrumpirla a la mitad con la API de ML Kit tal como está expuesta aquí.
+ * En la práctica esto significa que cancelar detiene el trabajo en, como
+ * mucho, unos segundos — no de forma instantánea.
  */
 class OfflineTranslationClient(
     sourceLangTag: String,
@@ -29,6 +36,7 @@ class OfflineTranslationClient(
     class OfflineTranslationException(msg: String, cause: Throwable? = null) : Exception(msg, cause)
 
     private val cache = ConcurrentHashMap<String, String>()
+    private val pendingSinceCheckpoint = ConcurrentHashMap<String, String>()
 
     @Volatile
     private var cancelled = false
@@ -54,8 +62,8 @@ class OfflineTranslationClient(
         translator = Translation.getClient(options)
     }
 
-    /** Descarga el modelo si hace falta. Bloqueante — llamar desde un hilo de fondo. */
-    fun ensureModelDownloaded(requireWifi: Boolean = false) {
+    /** Descarga el modelo si hace falta. Bloqueante — llamar desde un hilo/corrutina de fondo. */
+    suspend fun ensureModelDownloaded(requireWifi: Boolean = false) = withContext(Dispatchers.IO) {
         val conditions = DownloadConditions.Builder().apply {
             if (requireWifi) requireWifi()
         }.build()
@@ -67,18 +75,22 @@ class OfflineTranslationClient(
     }
 
     override fun cancel() { cancelled = true }
-    override fun exportCache(): Map<String, String> = cache.toMap()
+    override fun pendingCacheEntries(): Map<String, String> = pendingSinceCheckpoint.toMap()
+    override fun clearPendingCacheEntries() { pendingSinceCheckpoint.clear() }
 
-    override fun translate(text: String): String {
+    override suspend fun translate(text: String): String {
         if (text.isBlank()) return text
         if (cancelled) throw OfflineTranslationException("cancelado por el usuario")
         cache[text]?.let { return it }
-        return try {
-            val result = Tasks.await(translator.translate(text), 30, TimeUnit.SECONDS)
-            cache[text] = result
-            result
-        } catch (e: Exception) {
-            throw OfflineTranslationException("fallo al traducir localmente: ${e.message}", e)
+        return withContext(Dispatchers.IO) {
+            try {
+                val result = Tasks.await(translator.translate(text), 30, TimeUnit.SECONDS)
+                cache[text] = result
+                pendingSinceCheckpoint[text] = result
+                result
+            } catch (e: Exception) {
+                throw OfflineTranslationException("fallo al traducir localmente: ${e.message}", e)
+            }
         }
     }
 
