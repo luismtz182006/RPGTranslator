@@ -1,23 +1,33 @@
 package org.luismtz.rpgtranslator
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.*
-import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.documentfile.provider.DocumentFile
+import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.google.android.material.progressindicator.LinearProgressIndicator
 import com.google.android.material.textfield.TextInputEditText
+import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
 
     private var projectDirUri: Uri? = null
     private var outputDirUri: Uri? = null
-    private var activeClient: TextTranslator? = null
+    private var currentWorkId: UUID? = null
 
     private val prefsName = "rpg_translator_prefs"
     private val keyProjectDir = "project_dir_uri"
@@ -42,6 +52,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progressBar: LinearProgressIndicator
     private lateinit var tvProgressLabel: TextView
     private lateinit var tvStatus: TextView
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* si se niega, la traducción igual corre, solo sin notificación visible */ }
 
     private val pickProjectLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -91,12 +104,14 @@ class MainActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tvStatus)
 
         restoreSavedSettings()
+        requestNotificationPermissionIfNeeded()
+        reattachToRunningWork()
 
         findViewById<Button>(R.id.btnPickProject).setOnClickListener { pickProjectLauncher.launch(null) }
         findViewById<Button>(R.id.btnPickOutput).setOnClickListener { pickOutputLauncher.launch(null) }
         btnTranslate.setOnClickListener { startTranslation() }
         btnCancel.setOnClickListener {
-            activeClient?.cancel()
+            currentWorkId?.let { WorkManager.getInstance(this).cancelWorkById(it) }
             btnCancel.isEnabled = false
             btnCancel.text = "Cancelando…"
         }
@@ -104,6 +119,27 @@ class MainActivity : AppCompatActivity() {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("RPG Translator log", tvStatus.text.toString()))
             Toast.makeText(this, "Log copiado", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            if (!granted) notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    /** Si ya había una traducción corriendo en background (WorkManager) al reabrir la app, la reengancha. */
+    private fun reattachToRunningWork() {
+        WorkManager.getInstance(this).getWorkInfosForUniqueWorkLiveData(WORK_NAME).observe(this) { infos ->
+            val info = infos?.firstOrNull() ?: return@observe
+            if (info.state == WorkInfo.State.RUNNING || info.state == WorkInfo.State.ENQUEUED) {
+                currentWorkId = info.id
+                observeWork(info.id)
+                setUiEnabled(false)
+                progressBar.visibility = LinearProgressIndicator.VISIBLE
+            }
         }
     }
 
@@ -133,10 +169,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun log(msg: String) {
-        runOnUiThread { tvStatus.append(msg + "\n") }
-    }
-
     private fun setUiEnabled(enabled: Boolean) {
         btnTranslate.isEnabled = enabled
         btnTranslate.text = if (enabled) "Traducir" else "Traduciendo…"
@@ -147,6 +179,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startTranslation() {
         tvStatus.text = ""
+        tvProgressLabel.text = ""
         val projUri = projectDirUri
         val outUri = outputDirUri
         if (projUri == null || outUri == null) {
@@ -157,6 +190,7 @@ class MainActivity : AppCompatActivity() {
         val srcLang = etSourceLang.text?.toString()?.trim().takeUnless { it.isNullOrBlank() } ?: "auto"
         val tgtLang = etTargetLang.text?.toString()?.trim().takeUnless { it.isNullOrBlank() } ?: "es"
         val offline = rbOffline.isChecked
+        val engine = if (rbRenpy.isChecked) "renpy" else "rpgmaker"
 
         if (offline && srcLang.equals("auto", ignoreCase = true)) {
             Toast.makeText(this, "El modo local no soporta 'auto': escribe el idioma de origen real (ej. 'ja')", Toast.LENGTH_LONG).show()
@@ -166,109 +200,68 @@ class MainActivity : AppCompatActivity() {
         prefs.edit()
             .putString(keySrcLang, srcLang)
             .putString(keyTgtLang, tgtLang)
-            .putString(keyEngine, if (rbRenpy.isChecked) "renpy" else "rpgmaker")
+            .putString(keyEngine, engine)
             .apply()
 
-        val projectRoot = DocumentFile.fromTreeUri(this, projUri)
-        val outputRoot = DocumentFile.fromTreeUri(this, outUri)
-        if (projectRoot == null || outputRoot == null) {
-            log("No se pudieron abrir las carpetas elegidas")
-            return
-        }
+        val inputData = Data.Builder()
+            .putString(TranslationWorker.KEY_PROJECT_URI, projUri.toString())
+            .putString(TranslationWorker.KEY_OUTPUT_URI, outUri.toString())
+            .putString(TranslationWorker.KEY_ENGINE, engine)
+            .putString(TranslationWorker.KEY_SRC_LANG, srcLang)
+            .putString(TranslationWorker.KEY_TGT_LANG, tgtLang)
+            .putBoolean(TranslationWorker.KEY_OFFLINE, offline)
+            .build()
 
+        val request = OneTimeWorkRequestBuilder<TranslationWorker>()
+            .setInputData(inputData)
+            .build()
+
+        WorkManager.getInstance(this)
+            .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
+
+        currentWorkId = request.id
         progressBar.visibility = LinearProgressIndicator.VISIBLE
-        progressBar.progress = 0
+        progressBar.isIndeterminate = true
         setUiEnabled(false)
+        observeWork(request.id)
+    }
 
-        val startTime = System.currentTimeMillis()
+    private fun observeWork(id: UUID) {
+        WorkManager.getInstance(this).getWorkInfoByIdLiveData(id).observe(this) { info ->
+            if (info == null) return@observe
 
-        Thread {
-            var offlineClientRef: OfflineTranslationClient? = null
-            try {
-                val client: TextTranslator = if (offline) {
-                    log("Preparando traductor local ($srcLang → $tgtLang)…")
-                    val oc = OfflineTranslationClient(srcLang, tgtLang)
-                    offlineClientRef = oc
-                    activeClient = oc
-                    log("Descargando modelo de idioma si hace falta (una sola vez, puede tardar)…")
-                    oc.ensureModelDownloaded()
-                    log("Modelo listo. Traduciendo sin conexión…\n")
-                    oc
-                } else {
-                    val savedCache = TranslationCacheStore.load(this, srcLang, tgtLang)
-                    if (savedCache.isNotEmpty()) log("Reutilizando ${savedCache.size} traducción(es) ya hechas antes.\n")
-                    val tc = TranslationClient(srcLang, tgtLang, savedCache)
-                    activeClient = tc
-                    tc
-                }
+            info.progress.getString(TranslationWorker.KEY_LOG_TEXT)?.let { tvStatus.text = it }
+            info.progress.getString(TranslationWorker.KEY_PROGRESS_LABEL)?.let { tvProgressLabel.text = it }
 
-                if (rbRenpy.isChecked) {
-                    runRenpy(projectRoot, outputRoot, client)
-                } else {
-                    runRpgMaker(projectRoot, outputRoot, client)
+            when (info.state) {
+                WorkInfo.State.SUCCEEDED -> {
+                    val ok = info.outputData.getInt(TranslationWorker.KEY_RESULT_OK, 0)
+                    val fail = info.outputData.getInt(TranslationWorker.KEY_RESULT_FAIL, 0)
+                    Toast.makeText(this, "Listo: $ok ok, $fail con error", Toast.LENGTH_SHORT).show()
+                    finishWork()
                 }
-
-                if (!offline) {
-                    TranslationCacheStore.save(this, srcLang, tgtLang, client.exportCache())
+                WorkInfo.State.FAILED -> {
+                    val err = info.outputData.getString(TranslationWorker.KEY_RESULT_ERROR) ?: "error desconocido"
+                    tvStatus.append("\n✘ $err")
+                    finishWork()
                 }
-            } catch (e: Exception) {
-                log("✘ Error: ${e.message}")
-            } finally {
-                offlineClientRef?.close()
-                val elapsedSec = (System.currentTimeMillis() - startTime) / 1000
-                log("Tiempo total: ${elapsedSec}s.")
-                activeClient = null
-                runOnUiThread {
-                    progressBar.visibility = LinearProgressIndicator.GONE
-                    setUiEnabled(true)
+                WorkInfo.State.CANCELLED -> {
+                    tvStatus.append("\nCancelado.")
+                    finishWork()
                 }
+                else -> { /* ENQUEUED / RUNNING / BLOCKED: seguir esperando */ }
             }
-        }.start()
-    }
-
-    private fun runRpgMaker(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TextTranslator) {
-        val translator = RpgMakerTranslator(contentResolver, client)
-        val dataDir = translator.findDataFolder(projectRoot)
-        if (dataDir == null) {
-            log("✘ No se encontró una carpeta 'data' (ni 'www/data') dentro del proyecto elegido.")
-            return
         }
-
-        log("Traduciendo archivos de datos (varios en paralelo)…\n")
-        val outDataDir = outputRoot.findFile("data")?.takeIf { it.isDirectory }
-            ?: outputRoot.createDirectory("data")
-            ?: run { log("✘ No se pudo preparar la carpeta de salida"); return }
-
-        val (ok, fail) = translator.translateProject(
-            dataDir, outDataDir,
-            onProgress = { p ->
-                runOnUiThread {
-                    tvProgressLabel.text = "[archivo ${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — ${p.unitIndex}/${p.unitTotal}"
-                    progressBar.max = p.fileTotal
-                    progressBar.progress = p.fileIndex
-                }
-            },
-            onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
-        )
-        log("\nListo: $ok archivo(s) traducido(s), $fail con error de archivo completo.")
-        log("Solo se tradujo el texto — copia tú las carpetas de imágenes/audio/js si las necesitas en la salida.")
     }
 
-    private fun runRenpy(projectRoot: DocumentFile, outputRoot: DocumentFile, client: TextTranslator) {
-        val translator = RenpyTranslator(contentResolver, client)
-        log("Traduciendo archivos .rpy (varios en paralelo)…\n")
-        val (ok, fail) = translator.translateProject(
-            projectRoot, outputRoot,
-            onProgress = { p ->
-                runOnUiThread {
-                    tvProgressLabel.text = "[archivo ${p.fileIndex + 1}/${p.fileTotal}] ${p.fileName} — línea ${p.lineIndex}/${p.lineTotal}"
-                    progressBar.max = p.fileTotal
-                    progressBar.progress = p.fileIndex
-                }
-            },
-            onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
-        )
-        log("\nListo: $ok archivo(s) .rpy traducido(s), $fail con error de archivo completo.")
-        log("Solo se tradujo el texto — copia tú las imágenes/audio si las necesitas en la salida.")
+    private fun finishWork() {
+        progressBar.visibility = LinearProgressIndicator.GONE
+        progressBar.isIndeterminate = false
+        setUiEnabled(true)
+        currentWorkId = null
+    }
+
+    companion object {
+        private const val WORK_NAME = "rpg_translation_work"
     }
 }
