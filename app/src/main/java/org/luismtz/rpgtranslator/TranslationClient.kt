@@ -1,5 +1,10 @@
 package org.luismtz.rpgtranslator
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -9,37 +14,54 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Cliente de traducción automática. Usa el endpoint público (no oficial) de
- * Google Translate — el mismo que usan la mayoría de las herramientas hobby
- * de este tipo (no requiere API key). Pensado para uso personal moderado;
- * si Google empieza a bloquear por volumen, hay un backoff con reintentos.
+ * Cliente de traducción automática (endpoint público, no oficial, de Google
+ * Translate — no requiere API key).
  *
- * Cachea cada traducción exacta (mismo texto + mismo par de idiomas): en
- * proyectos de juego es normal repetir frases cientos de veces ("Sí", "No",
- * nombres de objetos, HP/MP, etc.), así que reutilizar el resultado ahorra
- * llamadas de red — más rápido y con menos oportunidades de que algo falle.
- * La caché se comparte entre todos los hilos que usan la misma instancia.
+ * - Cachea cada traducción exacta (mismo texto + mismo par de idiomas),
+ *   precargable desde [TranslationCacheDb] y con checkpoints incrementales
+ *   ([pendingCacheEntries] / [clearPendingCacheEntries]) para no perder
+ *   trabajo si la app se cierra a la mitad.
+ * - Un [RateLimiter] y un [Semaphore] compartidos evitan saturar el servicio,
+ *   sin importar cuántos archivos se procesen en paralelo.
+ * - [detectLanguage] permite detectar el idioma de origen UNA sola vez al
+ *   principio de la corrida, en vez de mandar "auto" en cada solicitud.
  */
 class TranslationClient(
-    private val sourceLang: String = "auto",
-    private val targetLang: String = "es",
-    initialCache: Map<String, String> = emptyMap()
+    private val sourceLang: String,
+    private val targetLang: String,
+    initialCache: Map<String, String> = emptyMap(),
+    private val config: TranslatorConfig = TranslatorConfig.DEFAULT,
+    private val rateLimiter: RateLimiter = RateLimiter(config.requestsPerSecond),
+    private val networkSemaphore: Semaphore = Semaphore(config.networkConcurrency)
 ) : TextTranslator {
-    class TranslationException(msg: String, cause: Throwable? = null) : Exception(msg, cause)
+
+    open class TranslationException(msg: String, cause: Throwable? = null) : Exception(msg, cause)
+    class RateLimitException(msg: String) : TranslationException(msg)
 
     private val cache = ConcurrentHashMap<String, String>(initialCache)
+    private val pendingSinceCheckpoint = ConcurrentHashMap<String, String>()
 
     @Volatile
     private var cancelled = false
 
-    /** Pide detener cuanto antes: las próximas llamadas a translate() fallan de inmediato (sin red). */
     override fun cancel() { cancelled = true }
 
-    /** Copia actual de la caché en memoria, para guardarla y reutilizarla en la siguiente corrida. */
-    override fun exportCache(): Map<String, String> = cache.toMap()
+    override fun pendingCacheEntries(): Map<String, String> = pendingSinceCheckpoint.toMap()
 
-    /** Traduce un texto simple. Vacío o solo-espacios se devuelve tal cual (no gasta llamada). */
-    override fun translate(text: String): String {
+    override fun clearPendingCacheEntries() { pendingSinceCheckpoint.clear() }
+
+    /** Detecta el idioma de origen a partir de una muestra de texto (una sola llamada). */
+    suspend fun detectLanguage(sample: String): String? {
+        if (sample.isBlank()) return null
+        return try {
+            val (_, detected) = doRequestWithDetectedLang(sample, "auto")
+            detected
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    override suspend fun translate(text: String): String {
         if (text.isBlank()) return text
         if (cancelled) throw TranslationException("cancelado por el usuario")
 
@@ -47,36 +69,38 @@ class TranslationClient(
 
         var attempt = 0
         var lastError: Exception? = null
-        while (attempt < 4) {
+        while (attempt < config.maxRetries) {
             if (cancelled) throw TranslationException("cancelado por el usuario")
             try {
-                val result = doRequest(text)
+                val (result, _) = networkSemaphore.withPermit {
+                    rateLimiter.acquire()
+                    withContext(Dispatchers.IO) { doRequestWithDetectedLang(text, sourceLang) }
+                }
                 cache[text] = result
+                pendingSinceCheckpoint[text] = result
                 return result
             } catch (e: RateLimitException) {
                 lastError = e
                 attempt++
-                // Google está limitando por volumen: esperamos bastante más que un error normal.
-                Thread.sleep(1500L * attempt + (0..300).random())
+                delay(config.rateLimitBaseDelayMs * attempt + (0..300).random())
             } catch (e: Exception) {
                 lastError = e
                 attempt++
-                Thread.sleep(400L * attempt + (0..200).random()) // backoff con jitter
+                delay(config.retryBaseDelayMs * attempt + (0..200).random())
             }
         }
-        throw TranslationException("Fallo al traducir tras 4 intentos: ${lastError?.message}", lastError)
+        throw TranslationException("Fallo al traducir tras ${config.maxRetries} intentos: ${lastError?.message}", lastError)
     }
 
-    private class RateLimitException(msg: String) : Exception(msg)
-
-    private fun doRequest(text: String): String {
+    /** Devuelve (texto_traducido, idioma_detectado_o_null). */
+    private fun doRequestWithDetectedLang(text: String, srcLangOverride: String): Pair<String, String?> {
         val encoded = URLEncoder.encode(text, "UTF-8")
         val urlStr = "https://translate.googleapis.com/translate_a/single" +
-            "?client=gtx&sl=$sourceLang&tl=$targetLang&dt=t&q=$encoded"
+            "?client=gtx&sl=$srcLangOverride&tl=$targetLang&dt=t&q=$encoded"
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         conn.requestMethod = "GET"
-        conn.connectTimeout = 10000
-        conn.readTimeout = 10000
+        conn.connectTimeout = config.connectTimeoutMs
+        conn.readTimeout = config.readTimeoutMs
         conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android)")
 
         val code = conn.responseCode
@@ -100,14 +124,14 @@ class TranslationClient(
             val seg = segments.optJSONArray(i) ?: continue
             sb.append(seg.optString(0, ""))
         }
-        return sb.toString()
+        val detected = root.optString(2, "").takeIf { it.isNotBlank() }
+        return Pair(sb.toString(), detected)
     }
 
     companion object {
         /**
          * Protege los códigos de control de RPG Maker (\V[1], \C[2], \N[3], \I[4], \., \|, \!, etc.)
-         * reemplazándolos por marcadores @@N@@ antes de traducir, para que el traductor
-         * automático no los altere. Devuelve el texto con marcadores y el mapa para restaurarlos.
+         * reemplazándolos por marcadores @@N@@ antes de traducir.
          */
         private val controlCodeRegex = Regex("""\\([A-Za-z]+(\[[^\]]*\])?|.)""")
 
@@ -123,7 +147,6 @@ class TranslationClient(
         fun restoreControlCodes(text: String, codes: List<String>): String {
             var result = text
             for (i in codes.indices) {
-                // El traductor a veces mete espacios alrededor del marcador; toleramos eso.
                 result = result.replace(Regex("""@@\s*$i\s*@@"""), Regex.escapeReplacement(codes[i]))
             }
             return result
