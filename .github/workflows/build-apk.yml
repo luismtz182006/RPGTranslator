@@ -21,8 +21,18 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Run unit tests
+        run: gradle test --no-daemon
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpg-translator-test-reports
+          path: app/build/reports/tests/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
