@@ -1,72 +1,92 @@
 package org.luismtz.rpgtranslator
 
 import android.content.ContentResolver
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Traduce los archivos .rpy de un proyecto Ren'Py trabajando línea por línea.
- * Solo procesa texto: NO copia imágenes, audio ni ningún otro asset — la
- * carpeta de salida solo contendrá los .rpy traducidos, replicando la
- * estructura de subcarpetas donde estaban.
  *
- * Procesa varios archivos .rpy EN PARALELO para que sea rápido. Si una línea
- * puntual falla al traducir, se deja tal cual en vez de perder el resto del
- * archivo.
+ * **Limitación conocida:** el reconocimiento de líneas de diálogo usa
+ * expresiones regulares, no un parser/AST real del lenguaje de Ren'Py. Cubre
+ * el caso común (`personaje "texto"` / `"texto":` en menús) pero no diálogo
+ * multi-línea, concatenación de strings, ni bloques ATL complejos. Escribir
+ * un parser completo del lenguaje sería un proyecto aparte de mucho mayor
+ * alcance.
+ *
+ * Solo procesa texto: NO copia imágenes, audio ni ningún otro asset.
+ * Procesa varios archivos .rpy en paralelo (corrutinas, acotado por
+ * [TranslatorConfig.fileConcurrency]).
  */
 class RenpyTranslator(
     private val resolver: ContentResolver,
     private val client: TextTranslator,
-    private val parallelism: Int = 6
+    private val config: TranslatorConfig = TranslatorConfig.DEFAULT,
+    private val onCheckpoint: () -> Unit = {}
 ) {
-    data class Progress(val fileIndex: Int, val fileTotal: Int, val fileName: String, val lineIndex: Int, val lineTotal: Int)
+    companion object {
+        private const val TAG = "RenpyTranslator"
+    }
+
+    data class Progress(val unitsDone: Int, val currentFile: String)
     data class Warning(val fileName: String, val detail: String)
 
-    private val dialogueRegex = Regex("""^(\s*)([A-Za-z_][A-Za-z0-9_.]*\s+)?"((?:[^"\\]|\\.)*)"(\s*)$""")
-    private val choiceRegex = Regex("""^(\s*)"((?:[^"\\]|\\.)*)"(\s*):(\s*)$""")
-
-    fun translateProject(
+    suspend fun translateProject(
         sourceDir: DocumentFile,
         outputDir: DocumentFile,
         onProgress: (Progress) -> Unit,
         onWarning: (Warning) -> Unit = {}
-    ): Pair<Int, Int> {
+    ): Pair<Int, Int> = coroutineScope {
         val rpyFiles = ArrayList<DocumentFile>()
         collectRpyFiles(sourceDir, rpyFiles)
 
         val ok = AtomicInteger(0)
         val fail = AtomicInteger(0)
-        val fileIndexCounter = AtomicInteger(0)
-        val dirCache = HashMap<String, DocumentFile>()
+        val unitsDone = AtomicInteger(0)
+        val unitsSinceCheckpoint = AtomicInteger(0)
+        val dirCache = java.util.Collections.synchronizedMap(HashMap<String, DocumentFile>())
         dirCache[""] = outputDir
 
-        val pool = Executors.newFixedThreadPool(parallelism)
-        try {
-            val futures = rpyFiles.map { file ->
-                pool.submit {
+        val fileSemaphore = Semaphore(config.fileConcurrency)
+
+        val deferreds = rpyFiles.map { file ->
+            async {
+                fileSemaphore.withPermit {
                     val name = file.name ?: "?"
                     try {
-                        val fileIdx = fileIndexCounter.getAndIncrement()
                         val outDir = synchronized(dirCache) { resolveOutputDir(file, sourceDir, outputDir, dirCache) }
-                        translateSingleFile(file, outDir, { detail -> onWarning(Warning(name, detail)) }) { lineIdx, lineTotal ->
-                            onProgress(Progress(fileIdx, rpyFiles.size, name, lineIdx, lineTotal))
-                        }
+                        translateSingleFile(
+                            file, outDir,
+                            onWarning = { detail ->
+                                Log.w(TAG, "$name: $detail")
+                                onWarning(Warning(name, detail))
+                            },
+                            onLineUnit = {
+                                onProgress(Progress(unitsDone.incrementAndGet(), name))
+                                if (unitsSinceCheckpoint.incrementAndGet() >= config.cacheCheckpointEvery) {
+                                    unitsSinceCheckpoint.set(0)
+                                    onCheckpoint()
+                                }
+                            }
+                        )
                         ok.incrementAndGet()
                     } catch (e: Exception) {
                         fail.incrementAndGet()
+                        Log.e(TAG, "$name: archivo completo falló", e)
                         onWarning(Warning(name, "archivo completo falló: ${e.message}"))
                     }
-                    Unit
                 }
             }
-            for (f in futures) f.get()
-        } finally {
-            pool.shutdown()
-            pool.awaitTermination(5, TimeUnit.MINUTES)
         }
-        return Pair(ok.get(), fail.get())
+        deferreds.awaitAll()
+        onCheckpoint()
+        Pair(ok.get(), fail.get())
     }
 
     private fun collectRpyFiles(dir: DocumentFile, out: MutableList<DocumentFile>) {
@@ -113,39 +133,38 @@ class RenpyTranslator(
         return segments
     }
 
-    private fun translateSingleFile(
+    private suspend fun translateSingleFile(
         file: DocumentFile, outDir: DocumentFile,
-        onWarning: (String) -> Unit, onLineProgress: (Int, Int) -> Unit
+        onWarning: (String) -> Unit, onLineUnit: () -> Unit
     ) {
         val lines = resolver.openInputStream(file.uri)?.bufferedReader(Charsets.UTF_8)?.readLines()
             ?: throw IllegalStateException("no se pudo leer ${file.name}")
 
         val outLines = ArrayList<String>(lines.size)
-        for ((i, line) in lines.withIndex()) {
-            outLines.add(translateLine(line, onWarning))
-            onLineProgress(i + 1, lines.size)
+        for (line in lines) {
+            outLines.add(translateLine(line, onWarning, onLineUnit))
         }
 
         FileCopier.writeTextFile(resolver, outDir, file.name ?: "script.rpy", "text/plain", outLines.joinToString("\n"))
     }
 
-    private fun translateLine(line: String, onWarning: (String) -> Unit): String {
-        dialogueRegex.matchEntire(line)?.let { m ->
-            val (indent, speaker, text, trail) = m.destructured
-            if (text.isBlank()) return line
-            val translated = translateProtected(text, onWarning)
-            return "$indent${speaker}\"$translated\"$trail"
+    private suspend fun translateLine(line: String, onWarning: (String) -> Unit, onUnit: () -> Unit): String {
+        RenpyLineParser.matchDialogue(line)?.let { m ->
+            if (m.text.isBlank()) return line
+            val translated = translateProtected(m.text, onWarning)
+            onUnit()
+            return "${m.indent}${m.speaker}\"$translated\"${m.trail}"
         }
-        choiceRegex.matchEntire(line)?.let { m ->
-            val (indent, text, mid, trail) = m.destructured
-            if (text.isBlank()) return line
-            val translated = translateProtected(text, onWarning)
-            return "$indent\"$translated\"$mid:$trail"
+        RenpyLineParser.matchChoice(line)?.let { m ->
+            if (m.text.isBlank()) return line
+            val translated = translateProtected(m.text, onWarning)
+            onUnit()
+            return "${m.indent}\"$translated\"${m.mid}:${m.trail}"
         }
         return line
     }
 
-    private fun translateProtected(text: String, onWarning: (String) -> Unit): String {
+    private suspend fun translateProtected(text: String, onWarning: (String) -> Unit): String {
         val (protectedText, tags) = TranslationClient.protectRenpyTags(text)
         return try {
             val translated = client.translate(protectedText)
