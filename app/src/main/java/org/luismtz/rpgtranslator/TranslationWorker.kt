@@ -118,6 +118,10 @@ class TranslationWorker(
         var offlineClientRef: OfflineTranslationClient? = null
         val startTime = System.currentTimeMillis()
 
+        // Idioma de origen efectivo: si srcLang es "auto" y se detecta, aquí queda el detectado.
+        // Se usa para guardar/cargar la caché bajo el idioma real, no bajo "auto".
+        var effectiveSrcLang = srcLang
+
         return try {
             val client: TextTranslator = if (offline) {
                 log("Preparando traductor local ($srcLang → $tgtLang)…")
@@ -129,14 +133,11 @@ class TranslationWorker(
                 log("Modelo listo. Traduciendo sin conexión…\n")
                 oc
             } else {
-                val savedCache = cacheDb.loadAll(srcLang, tgtLang)
-                if (savedCache.isNotEmpty()) log("Reutilizando ${savedCache.size} traducción(es) ya hechas antes.\n")
-
-                var effectiveSrcLang = srcLang
+                // 1) Detectar idioma si hace falta
                 if (srcLang.equals("auto", ignoreCase = true)) {
                     val sample = findSampleText(projectRoot, engine)
                     if (sample != null) {
-                        val probe = TranslationClient(srcLang, tgtLang, savedCache)
+                        val probe = TranslationClient(srcLang, tgtLang, emptyMap())
                         val detected = probe.detectLanguage(sample)
                         if (detected != null) {
                             effectiveSrcLang = detected
@@ -144,13 +145,21 @@ class TranslationWorker(
                         }
                     }
                 }
+
+                // 2) Cargar caché bajo el idioma efectivo; si difiere del original, unir la del original
+                val savedCache = cacheDb.loadAll(effectiveSrcLang, tgtLang).toMutableMap()
+                if (effectiveSrcLang != srcLang) {
+                    cacheDb.loadAll(srcLang, tgtLang).forEach { (k, v) -> savedCache.putIfAbsent(k, v) }
+                }
+                if (savedCache.isNotEmpty()) log("Reutilizando ${savedCache.size} traducción(es) ya hechas antes.\n")
+
                 TranslationClient(effectiveSrcLang, tgtLang, savedCache)
             }
 
             fun checkpoint() {
                 val pending = client.pendingCacheEntries()
                 if (pending.isNotEmpty() && !offline) {
-                    cacheDb.saveBatch(srcLang, tgtLang, pending)
+                    cacheDb.saveBatch(effectiveSrcLang, tgtLang, pending)
                     client.clearPendingCacheEntries()
                 }
             }
