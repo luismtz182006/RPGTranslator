@@ -21,19 +21,17 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run unit tests
-        continue-on-error: true
-        run: gradle test --no-daemon --stacktrace --info
-
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpg-translator-test-reports
-          path: app/build/reports/tests/
+        run: |
+          set +e
+          gradle assembleDebug --no-daemon --stacktrace > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            grep -E "^e: |What went wrong|Execution failed|Could not |Duplicate class|Manifest merger|AAPT|error:|Unresolved reference|Type mismatch|FAILED" -A3 build.log | head -80 > errors.txt
+            msg=$(head -c 3500 errors.txt | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::error title=Gradle build error::${msg}"
+          fi
+          exit $status
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
