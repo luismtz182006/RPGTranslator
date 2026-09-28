@@ -21,6 +21,21 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Run unit tests
+        continue-on-error: true
+        run: |
+          set +e
+          gradle test --no-daemon --stacktrace > test.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            grep -E "^e: |What went wrong|FAILED|AssertionError|expected:" -A3 test.log | head -60 > test-errors.txt
+            msg=$(head -c 3000 test-errors.txt | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::error title=Unit tests failed::${msg}"
+          else
+            echo "::notice title=Unit tests::Todos los tests unitarios pasaron"
+          fi
+          exit $status
+
       - name: Build debug APK
         run: |
           set +e
