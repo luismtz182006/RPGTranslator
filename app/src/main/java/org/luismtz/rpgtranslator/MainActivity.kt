@@ -237,12 +237,14 @@ class MainActivity : AppCompatActivity() {
                 WorkInfo.State.SUCCEEDED -> {
                     val ok = info.outputData.getInt(TranslationWorker.KEY_RESULT_OK, 0)
                     val fail = info.outputData.getInt(TranslationWorker.KEY_RESULT_FAIL, 0)
+                    info.outputData.getString(TranslationWorker.KEY_LOG_TEXT)?.let { tvStatus.text = it }
                     Toast.makeText(this, "Listo: $ok ok, $fail con error", Toast.LENGTH_SHORT).show()
                     finishWork()
                 }
                 WorkInfo.State.FAILED -> {
                     val err = info.outputData.getString(TranslationWorker.KEY_RESULT_ERROR) ?: "error desconocido"
-                    tvStatus.append("\n✘ $err")
+                    info.outputData.getString(TranslationWorker.KEY_LOG_TEXT)?.let { tvStatus.text = it }
+                    if (!tvStatus.text.contains(err)) tvStatus.append("\n✘ $err")
                     finishWork()
                 }
                 WorkInfo.State.CANCELLED -> {
