@@ -49,19 +49,51 @@ class TranslationWorker(
     }
 
     private val logLines = ArrayDeque<String>()
+    @Volatile private var currentLabel: String = ""
+    private val lastPublishMs = java.util.concurrent.atomic.AtomicLong(0L)
+    private val lastNotifyMs = java.util.concurrent.atomic.AtomicLong(0L)
 
-    private suspend fun log(msg: String) {
-        logLines.addLast(msg)
-        while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
-        setProgress(
-            Data.Builder()
-                .putString(KEY_LOG_TEXT, logLines.joinToString("\n"))
-                .build()
-        )
+    /** Últimos caracteres del log (WorkManager limita cada Data a ~10KB, así que se recorta). */
+    private fun currentLogText(): String =
+        synchronized(logLines) { logLines.joinToString("\n") }.takeLast(6000)
+
+    /**
+     * Publica log + etiqueta juntos (cada setProgress reemplaza al anterior, así que van en un solo Data).
+     * Con throttle para no saturar WorkManager, ya que se llama por cada frase traducida.
+     */
+    private fun publish() {
+        val now = System.currentTimeMillis()
+        val last = lastPublishMs.get()
+        if (now - last < 500 || !lastPublishMs.compareAndSet(last, now)) return
+        try {
+            setProgressAsync(
+                Data.Builder()
+                    .putString(KEY_LOG_TEXT, currentLogText())
+                    .putString(KEY_PROGRESS_LABEL, currentLabel.takeLast(300))
+                    .build()
+            )
+        } catch (_: Exception) { }
     }
 
-    private suspend fun updateLabel(label: String) {
-        setProgress(Data.Builder().putString(KEY_PROGRESS_LABEL, label).build())
+    private fun log(msg: String) {
+        synchronized(logLines) {
+            logLines.addLast(msg)
+            while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
+        }
+        publish()
+    }
+
+    private fun updateLabel(label: String) {
+        currentLabel = label
+        publish()
+    }
+
+    /** Actualiza la notificación (máx. una vez cada ~1.5s); nunca debe tumbar la traducción. */
+    private fun updateNotification(text: String) {
+        val now = System.currentTimeMillis()
+        val last = lastNotifyMs.get()
+        if (now - last < 1500 || !lastNotifyMs.compareAndSet(last, now)) return
+        try { setForegroundAsync(createForegroundInfo(text)) } catch (_: Exception) { }
     }
 
     override suspend fun doWork(): Result {
@@ -130,7 +162,7 @@ class TranslationWorker(
                     projectRoot, outputRoot,
                     onProgress = { p ->
                         updateLabel("${p.currentFile} — ${p.unitsDone} traducidas")
-                        setForegroundSafely(createForegroundInfo("Traduciendo… (${p.unitsDone})"))
+                        updateNotification("Traduciendo… (${p.unitsDone})")
                     },
                     onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
                 )
@@ -147,7 +179,7 @@ class TranslationWorker(
                     dataDir, outDataDir,
                     onProgress = { p ->
                         updateLabel("${p.currentFile} — ${p.unitsDone} traducidas")
-                        setForegroundSafely(createForegroundInfo("Traduciendo… (${p.unitsDone})"))
+                        updateNotification("Traduciendo… (${p.unitsDone})")
                     },
                     onWarning = { w -> log("⚠ ${w.fileName}: ${w.detail}") }
                 )
@@ -162,8 +194,11 @@ class TranslationWorker(
                 Data.Builder()
                     .putInt(KEY_RESULT_OK, ok)
                     .putInt(KEY_RESULT_FAIL, fail)
+                    .putString(KEY_LOG_TEXT, currentLogText())
                     .build()
             )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e // la cancelación cooperativa debe propagarse, no tragarse
         } catch (e: Exception) {
             log("✘ Error: ${e.message}")
             Result.failure(errorData(e.message ?: "error desconocido"))
@@ -172,7 +207,10 @@ class TranslationWorker(
         }
     }
 
-    private fun errorData(msg: String): Data = Data.Builder().putString(KEY_RESULT_ERROR, msg).build()
+    private fun errorData(msg: String): Data = Data.Builder()
+        .putString(KEY_RESULT_ERROR, msg)
+        .putString(KEY_LOG_TEXT, currentLogText())
+        .build()
 
     /** Busca una frase corta cualquiera del proyecto, solo para detectar el idioma de origen una vez. */
     private fun findSampleText(projectRoot: DocumentFile, engine: String): String? {
@@ -214,10 +252,6 @@ class TranslationWorker(
         return null
     }
 
-    /** setForeground puede fallar si el sistema ya está deteniendo el trabajo; no debe tumbar la traducción por eso. */
-    private suspend fun setForegroundSafely(info: ForegroundInfo) {
-        try { setForeground(info) } catch (_: Exception) { }
-    }
 
     private fun createForegroundInfo(text: String): ForegroundInfo {
         val nm = applicationContext.getSystemService(NotificationManager::class.java)
