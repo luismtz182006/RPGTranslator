@@ -40,7 +40,6 @@ class RpgMakerTranslator(
 
     private val databaseFields = mapOf(
         "Skills.json" to listOf("name", "description", "message1", "message2"),
-        "Troops.json" to listOf("name"),
         "States.json" to listOf("name", "message1", "message2", "message3", "message4"),
         "Actors.json" to listOf("name", "description", "nickname", "profile"),
         "Classes.json" to listOf("name", "description"),
@@ -93,6 +92,7 @@ class RpgMakerTranslator(
                         }
 
                         val result: String = when {
+                            name == "Troops.json" -> processTroopsJson(text, ::reportUnit, ::reportWarning)
                             databaseFields.containsKey(name) -> processDatabaseArray(text, databaseFields.getValue(name), ::reportUnit, ::reportWarning)
                             name == "System.json" -> processSystemJson(text, ::reportUnit, ::reportWarning)
                             name == "CommonEvents.json" -> processCommandListJson(text, isMap = false, ::reportUnit, ::reportWarning)
@@ -142,6 +142,31 @@ class RpgMakerTranslator(
                         onUnit()
                     }
                 }
+            }
+        }
+        return arr.toString()
+    }
+
+    /**
+     * Traduce Troops.json: el nombre de la tropa + los diálogos de batalla
+     * dentro de pages[].list[] (mismos códigos que en los eventos de mapa).
+     */
+    private suspend fun processTroopsJson(json: String, onUnit: () -> Unit, warn: (String) -> Unit): String {
+        val arr = JSONArray(json)
+        for (i in 0 until arr.length()) {
+            val troop = arr.optJSONObject(i) ?: continue
+
+            val name = troop.optString("name", "")
+            if (name.isNotBlank()) {
+                troop.put("name", tr(name, warn))
+                onUnit()
+            }
+
+            val pages = troop.optJSONArray("pages") ?: continue
+            for (p in 0 until pages.length()) {
+                val page = pages.optJSONObject(p) ?: continue
+                val list = page.optJSONArray("list") ?: continue
+                translateCommandList(list, onUnit, warn)
             }
         }
         return arr.toString()
@@ -212,11 +237,10 @@ class RpgMakerTranslator(
     /**
      * Recorre una lista de comandos de evento y traduce solo los códigos con
      * texto de diálogo real:
-     *  401/405 = línea de "Mostrar texto" / "Texto de desplazamiento"
+     *  401/405 = línea de "Mostrar texto" / continuación
      *  102     = opciones de "Mostrar opciones"
      *  402     = eco del texto de una opción en la rama "When [choice]"
-     *  105     = cabecera de "Texto de desplazamiento" (normalmente sin texto,
-     *            pero se revisa por si acaso alguna variante sí lo trae)
+     *  105     = cabecera de "Texto de desplazamiento"
      * Todo lo demás (scripts, condicionales, comentarios) se deja intacto para
      * no romper la lógica del juego.
      */
